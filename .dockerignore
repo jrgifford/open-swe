@@ -12,3 +12,5 @@ __pycache__
 .venv
 .DS_Store
 logs.txt
+.langgraph_api
+open-swe-dunkirk.pem

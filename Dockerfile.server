@@ -1,0 +1,32 @@
+# open-swe control-plane (server) image.
+#
+# Runs the LangGraph dev server, which serves all graphs + the FastAPI app
+# (agent.webapp:app) on :2024 with an in-memory runtime that flushes durable
+# state to ./.langgraph_api. In the StatefulSet a PVC is mounted at
+# /app/.langgraph_api so thread/checkpoint state survives restarts — no
+# Postgres/Redis needed for this single-node, lightweight self-host.
+#
+# The heavier repo Dockerfile is the *sandbox* image (git/gh/node/go/…); this
+# is a separate, small image for the server process only.
+FROM python:3.13-slim
+
+# uv for fast, reproducible, uv.lock-frozen installs.
+COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /usr/local/bin/
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . /app
+
+# Install the project against the committed lockfile, runtime deps only.
+RUN uv sync --frozen --no-dev
+
+ENV PATH="/app/.venv/bin:${PATH}"
+
+EXPOSE 2024
+
+# Bind 0.0.0.0 so the ClusterIP Service can reach it; the tailscale Ingress
+# terminates TLS and forwards plain HTTP. --no-browser: headless.
+CMD ["langgraph", "dev", "--host", "0.0.0.0", "--port", "2024", "--no-browser"]

@@ -230,11 +230,60 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
     runtime_class = os.getenv("K8S_SANDBOX_RUNTIME_CLASS", "").strip() or None
     service_account = os.getenv("K8S_SANDBOX_SERVICE_ACCOUNT", "").strip() or None
     pull_secret = os.getenv("K8S_SANDBOX_IMAGE_PULL_SECRET", "").strip() or None
+    enable_dind = _env("K8S_SANDBOX_ENABLE_DIND", "false").lower() in ("1", "true", "yes")
 
     resources = client.V1ResourceRequirements(
         requests={"cpu": cpu, "memory": memory},
         limits={"cpu": cpu, "memory": memory},
     )
+
+    sandbox_env: list[client.V1EnvVar] = []
+    sandbox_mounts: list[client.V1VolumeMount] = []
+    volumes: list[client.V1Volume] = []
+    sidecars: list[client.V1Container] = []
+
+    if enable_dind:
+        # Docker-in-Docker: a privileged sidecar runs dockerd; the sandbox's
+        # docker CLI reaches it over the shared pod network (localhost:2375).
+        # /workspace is a shared emptyDir so `docker build` context AND
+        # `docker run -v` bind mounts of sandbox files resolve on the daemon side.
+        # SECURITY: the dind sidecar is privileged (node-escape surface for
+        # untrusted agent code). Pair with K8S_SANDBOX_RUNTIME_CLASS=kata/gvisor
+        # to contain it. Opt-in via K8S_SANDBOX_ENABLE_DIND.
+        volumes.append(
+            client.V1Volume(name="workspace", empty_dir=client.V1EmptyDirVolumeSource())
+        )
+        volumes.append(
+            client.V1Volume(name="dind-storage", empty_dir=client.V1EmptyDirVolumeSource())
+        )
+        sandbox_mounts.append(client.V1VolumeMount(name="workspace", mount_path=workdir))
+        sandbox_env.append(client.V1EnvVar(name="DOCKER_HOST", value="tcp://localhost:2375"))
+        dind_image = _env(
+            "K8S_SANDBOX_DIND_IMAGE",
+            "zot.tail48c2e7.ts.net/proxy-dockerio/library/docker:dind",
+        )
+        sidecars.append(
+            client.V1Container(
+                name="dind",
+                image=dind_image,
+                security_context=client.V1SecurityContext(privileged=True),
+                # Empty cert dir => dockerd runs without TLS on plain tcp 2375.
+                env=[client.V1EnvVar(name="DOCKER_TLS_CERTDIR", value="")],
+                args=["--host=tcp://0.0.0.0:2375", "--host=unix:///var/run/docker.sock"],
+                resources=client.V1ResourceRequirements(
+                    requests={"cpu": "250m", "memory": "512Mi"},
+                    limits={
+                        "cpu": _env("K8S_SANDBOX_DIND_CPU", "2"),
+                        "memory": _env("K8S_SANDBOX_DIND_MEMORY", "4Gi"),
+                    },
+                ),
+                volume_mounts=[
+                    client.V1VolumeMount(name="workspace", mount_path=workdir),
+                    client.V1VolumeMount(name="dind-storage", mount_path="/var/lib/docker"),
+                ],
+            )
+        )
+
     container = client.V1Container(
         name="sandbox",
         image=image,
@@ -243,6 +292,8 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
         command=["/bin/sh", "-c", "trap 'exit 0' TERM INT; sleep infinity & wait"],
         working_dir=workdir,
         resources=resources,
+        env=sandbox_env or None,
+        volume_mounts=sandbox_mounts or None,
     )
     # Hard wall-clock cap so a sandbox the server forgets to delete (e.g. the
     # langgraph dev in-memory runtime never drives thread-end cleanup) can't
@@ -250,7 +301,7 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
     # primary GC; this is defence in depth. 0 disables it.
     active_deadline = int(_env("K8S_SANDBOX_ACTIVE_DEADLINE", "3600"))
     spec = client.V1PodSpec(
-        containers=[container],
+        containers=[container, *sidecars],
         restart_policy="Never",
         runtime_class_name=runtime_class,
         service_account_name=service_account,
@@ -258,6 +309,7 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
         # Sandboxes are ephemeral; don't let them linger draining on delete.
         termination_grace_period_seconds=5,
         active_deadline_seconds=active_deadline if active_deadline > 0 else None,
+        volumes=volumes or None,
     )
     return client.V1Pod(
         metadata=client.V1ObjectMeta(

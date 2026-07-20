@@ -1,0 +1,50 @@
+# Sandbox image for the k8s sandbox backend (SANDBOX_TYPE=k8s) — the environment
+# agent tasks run in. Must provide:
+#   - python3            (deepagents BaseSandbox read/write/edit helpers)
+#   - coreutils          (base64/timeout used by the k8s exec/file-transfer backend)
+#   - the coding toolchain: git, gh, node, ripgrep, build tools
+#
+# Lean on purpose (no go/rust/chromium): covers the common case fast. The full
+# upstream ./Dockerfile has the heavier toolchain if a workload needs it.
+FROM zot.tail48c2e7.ts.net/proxy-dockerio/library/python:3.12-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git curl wget ca-certificates gnupg openssh-client \
+      ripgrep jq unzip zip build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# GitHub CLI (official apt repo).
+RUN mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       | gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 22 (JS/TS projects).
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build deps for compiling python/ruby via mise (ruby-build / python-build).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      autoconf bison libssl-dev libyaml-dev libreadline-dev zlib1g-dev \
+      libncurses-dev libffi-dev libgdbm-dev uuid-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# mise (polyglot version manager) + a recent python & ruby as global defaults.
+# Shims dir is on PATH so `python`/`python3`/`ruby` resolve to the mise versions
+# in the agent's non-interactive `sh -c` execs. The base image's /usr/local/bin
+# python3 stays as a fallback for the deepagents server-side helpers.
+ENV MISE_DATA_DIR=/root/.local/share/mise
+ENV PATH=/root/.local/share/mise/shims:/root/.local/bin:${PATH}
+RUN curl -fsSL https://mise.run | sh \
+    && mise use -g python@3.13 ruby@3.3 \
+    && mise reshim \
+    && mise ls
+
+WORKDIR /workspace

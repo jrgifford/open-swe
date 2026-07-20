@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 _LABEL_APP = "open-swe-sandbox"
 _LABEL_ID = "open-swe.langchain.com/sandbox-id"
+_SANDBOX_CONTAINER = "sandbox"
 
 
 def _env(name: str, default: str) -> str:
@@ -119,6 +120,9 @@ class K8sSandbox(BaseSandbox):
             self._api.connect_get_namespaced_pod_exec,
             self._pod_name,
             self._namespace,
+            # Explicit: with a dind sidecar the pod has >1 container, and the API
+            # rejects an exec that doesn't name one. Always the sandbox container.
+            container=_SANDBOX_CONTAINER,
             command=argv,
             stderr=True,
             stdout=True,
@@ -232,8 +236,14 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
     pull_secret = os.getenv("K8S_SANDBOX_IMAGE_PULL_SECRET", "").strip() or None
     enable_dind = _env("K8S_SANDBOX_ENABLE_DIND", "false").lower() in ("1", "true", "yes")
 
+    # Requests are what the scheduler reserves; limits are the burst ceiling.
+    # A sandbox is mostly idle between execs, so reserve little (packs many
+    # sandboxes on one node) while still allowing bursts up to CPU/MEMORY.
     resources = client.V1ResourceRequirements(
-        requests={"cpu": cpu, "memory": memory},
+        requests={
+            "cpu": _env("K8S_SANDBOX_CPU_REQUEST", "250m"),
+            "memory": _env("K8S_SANDBOX_MEMORY_REQUEST", "512Mi"),
+        },
         limits={"cpu": cpu, "memory": memory},
     )
 
@@ -253,11 +263,17 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
         volumes.append(
             client.V1Volume(name="workspace", empty_dir=client.V1EmptyDirVolumeSource())
         )
+        dind_disk = _env("K8S_SANDBOX_DIND_DISK", "20Gi")
         volumes.append(
-            client.V1Volume(name="dind-storage", empty_dir=client.V1EmptyDirVolumeSource())
+            client.V1Volume(
+                name="dind-storage",
+                # Bound the layer store so a runaway build evicts THIS sandbox pod
+                # rather than filling node ephemeral storage (single node).
+                empty_dir=client.V1EmptyDirVolumeSource(size_limit=dind_disk),
+            )
         )
         sandbox_mounts.append(client.V1VolumeMount(name="workspace", mount_path=workdir))
-        sandbox_env.append(client.V1EnvVar(name="DOCKER_HOST", value="tcp://localhost:2375"))
+        sandbox_env.append(client.V1EnvVar(name="DOCKER_HOST", value="tcp://127.0.0.1:2375"))
         dind_image = _env(
             "K8S_SANDBOX_DIND_IMAGE",
             "zot.tail48c2e7.ts.net/proxy-dockerio/library/docker:dind",
@@ -267,9 +283,29 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
                 name="dind",
                 image=dind_image,
                 security_context=client.V1SecurityContext(privileged=True),
-                # Empty cert dir => dockerd runs without TLS on plain tcp 2375.
                 env=[client.V1EnvVar(name="DOCKER_TLS_CERTDIR", value="")],
-                args=["--host=tcp://0.0.0.0:2375", "--host=unix:///var/run/docker.sock"],
+                # Bind ONLY to loopback (shared pod netns) so the unauthenticated,
+                # privileged docker API is not reachable from other pods on the
+                # cluster network. Leading `dockerd` stops the entrypoint from
+                # also injecting a 0.0.0.0 bind. --tls=false avoids the ~15s
+                # non-loopback-TLS-deprecation startup sleep.
+                args=[
+                    "dockerd",
+                    "--host=unix:///var/run/docker.sock",
+                    "--host=tcp://127.0.0.1:2375",
+                    "--tls=false",
+                ],
+                # Gate pod-Ready on dockerd actually serving. Must be an EXEC
+                # probe (run inside the container): a TCP probe hits the pod IP,
+                # which can't reach the loopback-bound daemon. Checks the exact
+                # endpoint the sandbox uses.
+                readiness_probe=client.V1Probe(
+                    _exec=client.V1ExecAction(
+                        command=["docker", "-H", "tcp://127.0.0.1:2375", "version"],
+                    ),
+                    period_seconds=2,
+                    failure_threshold=45,
+                ),
                 resources=client.V1ResourceRequirements(
                     requests={"cpu": "250m", "memory": "512Mi"},
                     limits={
@@ -285,7 +321,7 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
         )
 
     container = client.V1Container(
-        name="sandbox",
+        name=_SANDBOX_CONTAINER,
         image=image,
         # Keep PID 1 alive so the pod stays around for repeated exec sessions;
         # `wait` lets a TERM propagate for a clean shutdown.

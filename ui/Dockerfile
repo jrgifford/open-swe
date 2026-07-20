@@ -9,8 +9,11 @@
 # --- build stage ---------------------------------------------------------
 FROM zot.tail48c2e7.ts.net/proxy-dockerio/library/node:22-slim AS build
 
-# Backend origin baked into the client bundle at build time.
-ARG VITE_DASHBOARD_API_BASE_URL=https://open-swe.tail48c2e7.ts.net
+# Empty = same-origin: the client calls a relative `/dashboard/api/*`, which
+# nginx reverse-proxies to the backend (see nginx.conf), keeping the UI, API, and
+# OAuth callback on one origin (e.g. open-swe.jrg.dev) — no CORS, first-party
+# cookie. Override with --build-arg for a split-origin deployment.
+ARG VITE_DASHBOARD_API_BASE_URL=""
 ENV VITE_DASHBOARD_API_BASE_URL=${VITE_DASHBOARD_API_BASE_URL}
 
 # corepack ships with node:22; use it to run the pnpm version pinned by

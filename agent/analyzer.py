@@ -56,6 +56,7 @@ from .utils import ttl_cache
 from .utils.analyzer_skills import SKILLS_ROUTE, skill_path_for_mode
 from .utils.deferred_model import make_deferred_error_model
 from .utils.github_app import get_github_app_installation_token
+from .utils.github_sandbox_auth import configure_k8s_github_auth
 from .utils.model import DEFAULT_LLM_REASONING, make_model, provider_model_kwargs
 from .utils.sandbox_paths import aresolve_sandbox_work_dir
 from .utils.sandbox_state import unwrap_sandbox_backend
@@ -147,6 +148,7 @@ class PrepareAnalyzerRunMiddleware(BasePrepareRunMiddleware):
             github_token = await get_github_app_installation_token()
         if isinstance(github_token, str) and github_token:
             await _configure_sandbox_github_proxy(sandbox_backend, github_token)
+            await configure_k8s_github_auth(sandbox_backend, github_token)
         system_prompt = STYLE_ANALYZER_PROMPT.format(
             repo_owner=owner or "<owner>",
             repo_name=name or "<repo>",

@@ -130,6 +130,7 @@ from .utils.dashboard_links import dashboard_plan_url, dashboard_thread_url
 from .utils.deferred_model import make_deferred_error_model
 from .utils.github_app import get_github_app_installation_token_with_expiry
 from .utils.github_proxy import record_proxy_token_expiry
+from .utils.github_sandbox_auth import configure_k8s_github_auth
 from .utils.json_types import as_json_object
 from .utils.model import (
     DEFAULT_LLM_REASONING,
@@ -738,6 +739,8 @@ class PrepareAgentRunMiddleware(BasePrepareRunMiddleware):
             triggering_user_identity_task,
             sandbox_task,
         )
+        # k8s backend has no LangSmith proxy: inject git/gh creds into the sandbox.
+        await configure_k8s_github_auth(sandbox_backend, github_token)
         del github_token
         work_dir = await aresolve_sandbox_work_dir(sandbox_backend)
         repo_custom_instructions = await _resolve_repo_custom_instructions(prompt_default_repo)

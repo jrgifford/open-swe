@@ -28,6 +28,19 @@ Configuration (all via environment variables):
                                             self-terminates the pod. Defence in
                                             depth against orphaned sandboxes; set
                                             to 0 to disable.
+    K8S_SANDBOX_ENABLE_GH_PROXY="false"     Opt-in: run an egress-auth-proxy
+                                            sidecar so git/gh authenticate via a
+                                            MITM proxy and the GitHub token never
+                                            enters the sandbox. See
+                                            utils/k8s_github_proxy.py.
+    K8S_SANDBOX_GH_PROXY_IMAGE=<img>        REQUIRED when the proxy is enabled:
+                                            the egress-auth-proxy image.
+    K8S_SANDBOX_GH_PROXY_CONTROL_API_KEY="" Shared key the agent server uses to
+                                            PATCH the sidecar control plane; also
+                                            injected into the sidecar. Empty ->
+                                            sidecar runs with auth disabled.
+    K8S_SANDBOX_GH_PROXY_DATA_PORT="8080"   Sidecar data-plane (proxy) port.
+    K8S_SANDBOX_GH_PROXY_CONTROL_PORT="8081" Sidecar control-plane (config) port.
 
 Auth resolves in-cluster config first (when the agent server itself runs as a
 pod), then falls back to the local kubeconfig for development.
@@ -105,7 +118,9 @@ class K8sSandbox(BaseSandbox):
         wrapped = f"{command} 2>&1"
         if effective_timeout and effective_timeout > 0:
             wrapped = f"timeout {effective_timeout}s /bin/sh -c {_shquote(wrapped)}"
-        read_timeout = (effective_timeout + 15) if effective_timeout and effective_timeout > 0 else None
+        read_timeout = (
+            (effective_timeout + 15) if effective_timeout and effective_timeout > 0 else None
+        )
         output, exit_code = self._run(["/bin/sh", "-c", wrapped], read_timeout=read_timeout)
         return ExecuteResponse(output=output, exit_code=exit_code, truncated=False)
 
@@ -131,7 +146,9 @@ class K8sSandbox(BaseSandbox):
             _preload_content=False,
         )
         chunks: list[str] = []
-        resp.run_forever(timeout=read_timeout if read_timeout is not None else self._default_timeout + 15)
+        resp.run_forever(
+            timeout=read_timeout if read_timeout is not None else self._default_timeout + 15
+        )
         while resp.peek_stdout():
             chunks.append(resp.read_stdout())
         while resp.peek_stderr():
@@ -177,7 +194,9 @@ class K8sSandbox(BaseSandbox):
                 # channel; a missing file yields non-zero exit and empty stdout.
                 output, exit_code = self._run(["/bin/sh", "-c", f"base64 {_shquote(path)}"])
                 if exit_code not in (0, None):
-                    responses.append(FileDownloadResponse(path=path, content=None, error="file_not_found"))
+                    responses.append(
+                        FileDownloadResponse(path=path, content=None, error="file_not_found")
+                    )
                     continue
                 content = base64.b64decode(output.encode("ascii"))
                 responses.append(FileDownloadResponse(path=path, content=content, error=None))
@@ -251,6 +270,11 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
     sandbox_mounts: list[client.V1VolumeMount] = []
     volumes: list[client.V1Volume] = []
     sidecars: list[client.V1Container] = []
+    init_containers: list[client.V1Container] = []
+    # Keep PID 1 alive so the pod stays around for repeated exec sessions;
+    # `wait` lets a TERM propagate for a clean shutdown. The GitHub-proxy path
+    # below prepends a one-shot CA install to this.
+    sandbox_command = ["/bin/sh", "-c", "trap 'exit 0' TERM INT; sleep infinity & wait"]
 
     if enable_dind:
         # Docker-in-Docker: a privileged sidecar runs dockerd; the sandbox's
@@ -260,9 +284,7 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
         # SECURITY: the dind sidecar is privileged (node-escape surface for
         # untrusted agent code). Pair with K8S_SANDBOX_RUNTIME_CLASS=kata/gvisor
         # to contain it. Opt-in via K8S_SANDBOX_ENABLE_DIND.
-        volumes.append(
-            client.V1Volume(name="workspace", empty_dir=client.V1EmptyDirVolumeSource())
-        )
+        volumes.append(client.V1Volume(name="workspace", empty_dir=client.V1EmptyDirVolumeSource()))
         dind_disk = _env("K8S_SANDBOX_DIND_DISK", "20Gi")
         volumes.append(
             client.V1Volume(
@@ -320,12 +342,124 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
             )
         )
 
+    enable_gh_proxy = _env("K8S_SANDBOX_ENABLE_GH_PROXY", "false").lower() in ("1", "true", "yes")
+    if enable_gh_proxy:
+        # egress-auth-proxy sidecar (LangSmith-compatible): git/gh in the sandbox
+        # make credential-free requests through a MITM proxy that injects the
+        # GitHub token on the wire, so the token never lands in the sandbox
+        # container's filesystem or env. The agent server configures per-run
+        # github rules against the sidecar's control plane (see
+        # utils/k8s_github_proxy.py). Opt-in via K8S_SANDBOX_ENABLE_GH_PROXY.
+        proxy_image = os.getenv("K8S_SANDBOX_GH_PROXY_IMAGE", "").strip()
+        if not proxy_image:
+            raise ValueError(
+                "K8S_SANDBOX_GH_PROXY_IMAGE is required when K8S_SANDBOX_ENABLE_GH_PROXY is set"
+            )
+        proxy_api_key = os.getenv("K8S_SANDBOX_GH_PROXY_CONTROL_API_KEY", "").strip()
+        certs_dir = "/certs"
+        ca_cert = f"{certs_dir}/mitmproxy-ca-cert.pem"
+        data_port = _env("K8S_SANDBOX_GH_PROXY_DATA_PORT", "8080")
+        control_port = _env("K8S_SANDBOX_GH_PROXY_CONTROL_PORT", "8081")
+
+        volumes.append(
+            client.V1Volume(name="gh-proxy-certs", empty_dir=client.V1EmptyDirVolumeSource())
+        )
+        certs_mount = client.V1VolumeMount(name="gh-proxy-certs", mount_path=certs_dir)
+
+        # Init container: generate a per-pod, ephemeral MITM CA into the shared
+        # volume using mitmproxy's own generator (guaranteed compatible with the
+        # sidecar). Runs as root so the root-owned emptyDir is writable and the
+        # CA key it writes stays readable by the root sidecar + sandbox.
+        init_containers.append(
+            client.V1Container(
+                name="gh-proxy-ca-init",
+                image=proxy_image,
+                security_context=client.V1SecurityContext(run_as_user=0),
+                command=["/bin/sh", "-c"],
+                args=[
+                    "mitmdump --set confdir=/certs --listen-host 127.0.0.1 "
+                    "--listen-port 8080 >/dev/null 2>&1 & p=$!; "
+                    "for _ in $(seq 1 100); do [ -f /certs/mitmproxy-ca-cert.pem ] && break; "
+                    'sleep 0.1; done; kill "$p" 2>/dev/null; '
+                    "test -f /certs/mitmproxy-ca-cert.pem"
+                ],
+                volume_mounts=[certs_mount],
+                resources=client.V1ResourceRequirements(
+                    requests={"cpu": "50m", "memory": "96Mi"},
+                    limits={"cpu": "500m", "memory": "256Mi"},
+                ),
+            )
+        )
+
+        proxy_env = [
+            client.V1EnvVar(name="EAP_CONFDIR", value=certs_dir),
+            client.V1EnvVar(name="EAP_DATA_HOST", value="127.0.0.1"),
+            client.V1EnvVar(name="EAP_DATA_PORT", value=data_port),
+            client.V1EnvVar(name="EAP_CONTROL_HOST", value="0.0.0.0"),
+            client.V1EnvVar(name="EAP_CONTROL_PORT", value=control_port),
+        ]
+        if proxy_api_key:
+            proxy_env.append(client.V1EnvVar(name="EAP_CONTROL_API_KEY", value=proxy_api_key))
+        else:
+            # No key configured (dev): let the sidecar still start.
+            proxy_env.append(client.V1EnvVar(name="EAP_ALLOW_NO_AUTH", value="true"))
+        # Sidecar: data plane on loopback (shared pod netns → only the sandbox
+        # container can route through it); control plane on the pod IP so the
+        # agent server can PATCH github rules. Runs as root to read the CA key.
+        sidecars.append(
+            client.V1Container(
+                name="gh-proxy",
+                image=proxy_image,
+                security_context=client.V1SecurityContext(run_as_user=0),
+                env=proxy_env,
+                volume_mounts=[certs_mount],
+                readiness_probe=client.V1Probe(
+                    http_get=client.V1HTTPGetAction(path="/healthz", port=int(control_port)),
+                    period_seconds=2,
+                    failure_threshold=30,
+                ),
+                resources=client.V1ResourceRequirements(
+                    requests={"cpu": "50m", "memory": "128Mi"},
+                    limits={"cpu": "1", "memory": "512Mi"},
+                ),
+            )
+        )
+
+        # Route sandbox egress through the proxy and trust its CA. The proxy
+        # MITMs all TLS, so the sandbox only needs this CA; it is added
+        # additively (system store + node/python/git bundles) alongside the
+        # system roots rather than replacing them.
+        proxy_url = f"http://127.0.0.1:{data_port}"
+        no_proxy = "localhost,127.0.0.1,169.254.169.254,.svc,.cluster.local"
+        for name, value in (
+            ("HTTP_PROXY", proxy_url),
+            ("HTTPS_PROXY", proxy_url),
+            ("http_proxy", proxy_url),
+            ("https_proxy", proxy_url),
+            ("NO_PROXY", no_proxy),
+            ("no_proxy", no_proxy),
+            ("NODE_EXTRA_CA_CERTS", ca_cert),
+            ("REQUESTS_CA_BUNDLE", ca_cert),
+            ("GIT_SSL_CAINFO", ca_cert),
+        ):
+            sandbox_env.append(client.V1EnvVar(name=name, value=value))
+        sandbox_mounts.append(
+            client.V1VolumeMount(name="gh-proxy-certs", mount_path=certs_dir, read_only=True)
+        )
+        # Install the CA into the system trust store at startup (before any git).
+        sandbox_command = [
+            "/bin/sh",
+            "-c",
+            "if [ -f /certs/mitmproxy-ca-cert.pem ]; then "
+            "cp /certs/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/egress-auth-proxy.crt && "
+            "update-ca-certificates >/dev/null 2>&1 || true; fi; "
+            "trap 'exit 0' TERM INT; sleep infinity & wait",
+        ]
+
     container = client.V1Container(
         name=_SANDBOX_CONTAINER,
         image=image,
-        # Keep PID 1 alive so the pod stays around for repeated exec sessions;
-        # `wait` lets a TERM propagate for a clean shutdown.
-        command=["/bin/sh", "-c", "trap 'exit 0' TERM INT; sleep infinity & wait"],
+        command=sandbox_command,
         working_dir=workdir,
         resources=resources,
         env=sandbox_env or None,
@@ -338,10 +472,13 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
     active_deadline = int(_env("K8S_SANDBOX_ACTIVE_DEADLINE", "3600"))
     spec = client.V1PodSpec(
         containers=[container, *sidecars],
+        init_containers=init_containers or None,
         restart_policy="Never",
         runtime_class_name=runtime_class,
         service_account_name=service_account,
-        image_pull_secrets=[client.V1LocalObjectReference(name=pull_secret)] if pull_secret else None,
+        image_pull_secrets=[client.V1LocalObjectReference(name=pull_secret)]
+        if pull_secret
+        else None,
         # Sandboxes are ephemeral; don't let them linger draining on delete.
         termination_grace_period_seconds=5,
         active_deadline_seconds=active_deadline if active_deadline > 0 else None,
@@ -368,7 +505,9 @@ def _wait_for_ready(api: client.CoreV1Api, namespace: str, pod_name: str, timeou
             if any(c.type == "Ready" and c.status == "True" for c in conditions):
                 return
         if phase in ("Failed", "Succeeded"):
-            raise RuntimeError(f"sandbox pod {pod_name} entered terminal phase {phase} before becoming ready")
+            raise RuntimeError(
+                f"sandbox pod {pod_name} entered terminal phase {phase} before becoming ready"
+            )
         time.sleep(1.5)
     raise TimeoutError(f"sandbox pod {pod_name} not ready within {timeout}s")
 
@@ -391,7 +530,9 @@ def create_k8s_sandbox(sandbox_id: str | None = None):
         try:
             api.read_namespaced_pod(name=sandbox_id, namespace=namespace)
         except ApiException as exc:
-            raise RuntimeError(f"cannot reconnect to sandbox pod {sandbox_id}: {exc.reason}") from exc
+            raise RuntimeError(
+                f"cannot reconnect to sandbox pod {sandbox_id}: {exc.reason}"
+            ) from exc
         return K8sSandbox(api=api, namespace=namespace, pod_name=sandbox_id)
 
     pod_name = f"open-swe-sbx-{uuid.uuid4().hex[:10]}"

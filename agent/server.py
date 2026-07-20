@@ -130,7 +130,7 @@ from .utils.dashboard_links import dashboard_plan_url, dashboard_thread_url
 from .utils.deferred_model import make_deferred_error_model
 from .utils.github_app import get_github_app_installation_token_with_expiry
 from .utils.github_proxy import record_proxy_token_expiry
-from .utils.github_sandbox_auth import configure_k8s_github_auth
+from .utils.k8s_github_proxy import configure_k8s_github_proxy
 from .utils.json_types import as_json_object
 from .utils.model import (
     DEFAULT_LLM_REASONING,
@@ -280,13 +280,13 @@ async def _create_sandbox_with_proxy(
             permissions=permissions,
         )
     elif sandbox_type == "k8s":
-        # No proxy for k8s: inject git/gh creds into the fresh pod here so ALL
-        # creation paths (initial create, _recreate_sandbox, check_or_recreate_sandbox)
+        # Configure the pod's egress-auth-proxy sidecar here so ALL creation
+        # paths (initial create, _recreate_sandbox, check_or_recreate_sandbox)
         # are covered — not just the per-run prepare hooks. Keeps a mid-run pod
-        # recreation authenticated.
+        # recreation authenticated, and the token stays out of the sandbox.
         token, _expires_at, _permissions = await _resolve_proxy_token(github_proxy_token)
         if token:
-            await configure_k8s_github_auth(sandbox_backend, token)
+            await configure_k8s_github_proxy(sandbox_backend, token)
 
     return sandbox_backend
 
@@ -747,8 +747,9 @@ class PrepareAgentRunMiddleware(BasePrepareRunMiddleware):
             triggering_user_identity_task,
             sandbox_task,
         )
-        # k8s backend has no LangSmith proxy: inject git/gh creds into the sandbox.
-        await configure_k8s_github_auth(sandbox_backend, github_token)
+        # k8s backend: configure the pod's egress-auth-proxy sidecar with the
+        # github token (kept out of the sandbox; no-op unless the proxy is on).
+        await configure_k8s_github_proxy(sandbox_backend, github_token)
         del github_token
         work_dir = await aresolve_sandbox_work_dir(sandbox_backend)
         repo_custom_instructions = await _resolve_repo_custom_instructions(prompt_default_repo)

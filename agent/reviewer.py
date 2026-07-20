@@ -109,7 +109,7 @@ from .utils.agents_md import fetch_agents_md, fetch_scoped_agents_md
 from .utils.api_standards_skill import fetch_api_standards_skill
 from .utils.deferred_model import make_deferred_error_model
 from .utils.github_app import get_github_app_installation_token_with_expiry
-from .utils.github_sandbox_auth import configure_k8s_github_auth
+from .utils.k8s_github_proxy import configure_k8s_github_proxy
 from .utils.github_token import cache_github_token_for_thread
 from .utils.model import DEFAULT_LLM_REASONING, make_model, provider_model_kwargs
 from .utils.repo_prep import materialize_trusted_skills, prepare_review_repo
@@ -1005,8 +1005,9 @@ class PrepareReviewerRunMiddleware(BasePrepareRunMiddleware):
             self._thread_id, configurable
         )
         if isinstance(github_token, str) and github_token:
-            # k8s backend has no LangSmith proxy: inject git/gh creds directly.
-            await configure_k8s_github_auth(sandbox_backend, github_token)
+            # k8s backend: configure the egress-auth-proxy sidecar (token stays
+            # out of the sandbox; no-op unless the proxy is enabled).
+            await configure_k8s_github_proxy(sandbox_backend, github_token)
         work_dir = await aresolve_sandbox_work_dir(sandbox_backend)
 
         repo_owner = str(repo_config.get("owner", ""))

@@ -279,6 +279,14 @@ async def _create_sandbox_with_proxy(
             repositories=github_proxy_repositories,
             permissions=permissions,
         )
+    elif sandbox_type == "k8s":
+        # No proxy for k8s: inject git/gh creds into the fresh pod here so ALL
+        # creation paths (initial create, _recreate_sandbox, check_or_recreate_sandbox)
+        # are covered — not just the per-run prepare hooks. Keeps a mid-run pod
+        # recreation authenticated.
+        token, _expires_at, _permissions = await _resolve_proxy_token(github_proxy_token)
+        if token:
+            await configure_k8s_github_auth(sandbox_backend, token)
 
     return sandbox_backend
 

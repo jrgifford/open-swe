@@ -35,7 +35,9 @@ _GH_SHIM = "/usr/local/bin/gh"
 
 def _setup_command(token: str) -> str:
     tq = shlex.quote(token)
-    return "; ".join(
+    # `&&`-joined so any step failing short-circuits and surfaces as a non-zero
+    # exit code (rather than being masked by a later step's success).
+    return " && ".join(
         [
             "umask 077",
             f"printf '%s' {tq} > {_TOKEN_FILE}",
@@ -72,6 +74,16 @@ async def configure_k8s_github_auth(sandbox_backend, github_token: str | None) -
     if not github_token:
         return
     try:
-        await sandbox_backend.aexecute(_setup_command(github_token))
+        resp = await sandbox_backend.aexecute(_setup_command(github_token))
     except Exception:  # noqa: BLE001 - best-effort credential setup
         logger.warning("Failed to configure GitHub auth in k8s sandbox", exc_info=True)
+        return
+    exit_code = getattr(resp, "exit_code", None)
+    if exit_code not in (0, None):
+        # resp.output never contains the token (the setup command emits nothing on
+        # success and echoes no arg), so it is safe to log for diagnostics.
+        logger.warning(
+            "GitHub auth setup in k8s sandbox exited %s: %s",
+            exit_code,
+            (getattr(resp, "output", "") or "").strip()[:500],
+        )

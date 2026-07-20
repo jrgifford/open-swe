@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sandbox-cleanup
+  namespace: open-swe-system
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: sandbox-cleanup
+          restartPolicy: Never
+          containers:
+            - name: cleanup
+              image: {{ .Values.images.controlPlane | quote }}
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "agent.integrations.k3_cleanup"]
+              env:
+                - {name: K3_SANDBOX_NAMESPACE, value: open-swe-sandboxes}
+                - {name: K3_SANDBOX_IDLE_SECONDS, value: {{ .Values.config.sandboxIdleSeconds | quote }}}
+                - {name: K3_SANDBOX_RETENTION_SECONDS, value: {{ .Values.config.sandboxRetentionSeconds | quote }}}
+              resources:
+                requests: {cpu: 10m, memory: 64Mi}
+                limits: {cpu: 100m, memory: 128Mi}

@@ -1,0 +1,8 @@
+[tools]
+python = "3.12.10"
+uv = "0.9.26"
+node = "22.22.0"
+pnpm = "11.9.0"
+"aqua:k3d-io/k3d" = "5.8.3"
+"aqua:kubernetes/kubectl" = "1.32.3"
+"aqua:helm/helm" = "3.17.2"

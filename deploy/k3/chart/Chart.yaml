@@ -1,0 +1,5 @@
+apiVersion: v2
+name: open-swe-local
+version: 0.1.0
+appVersion: "local"
+description: Development-only Open SWE runtime for k3d

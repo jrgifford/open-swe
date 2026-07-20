@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-credential-proxy
+  namespace: open-swe-system
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: github-credential-proxy}
+  template:
+    metadata:
+      labels: {app: github-credential-proxy}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {fsGroup: 1000}
+      containers:
+        - name: proxy
+          image: {{ required "images.proxy is required" .Values.images.proxy | quote }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PROXY_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef: {name: open-swe-env, key: K3_GITHUB_PROXY_ADMIN_TOKEN}
+          ports:
+            - {name: proxy, containerPort: 8080}
+            - {name: admin, containerPort: 8081}
+          volumeMounts:
+            - {name: ca, mountPath: /root/.mitmproxy}
+          readinessProbe:
+            httpGet: {path: /healthz, port: admin}
+            periodSeconds: 3
+          resources: {{ toYaml .Values.resources.proxy | nindent 12 }}
+      volumes:
+        - name: ca
+          persistentVolumeClaim: {claimName: proxy-ca}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: github-credential-proxy
+  namespace: open-swe-system
+spec:
+  selector: {app: github-credential-proxy}
+  ports:
+    - {name: proxy, port: 8080, targetPort: proxy}
+    - {name: admin, port: 8081, targetPort: admin}

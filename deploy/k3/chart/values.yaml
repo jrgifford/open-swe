@@ -1,0 +1,24 @@
+images:
+  controlPlane: ""
+  ui: ""
+  sandbox: ""
+  proxy: ""
+config:
+  publicUrl: http://localhost:3000
+  sandboxCapacity: 2
+  sandboxQueueTimeoutSeconds: "120"
+  sandboxIdleSeconds: "3600"
+  sandboxRetentionSeconds: "2592000"
+  sandboxStorage: 10Gi
+  graphStorage: 10Gi
+  proxyStorage: 256Mi
+resources:
+  controlPlane:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {cpu: "2", memory: 4Gi}
+  ui:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+  proxy:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: "1", memory: 1Gi}

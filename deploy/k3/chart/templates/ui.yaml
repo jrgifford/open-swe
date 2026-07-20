@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ui
+  namespace: open-swe-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: open-swe-ui}
+  template:
+    metadata:
+      labels: {app: open-swe-ui}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: ui
+          image: {{ required "images.ui is required" .Values.images.ui | quote }}
+          imagePullPolicy: IfNotPresent
+          ports: [{name: http, containerPort: 3000}]
+          env:
+            - {name: HOST, value: 0.0.0.0}
+            - {name: PORT, value: "3000"}
+          readinessProbe:
+            httpGet: {path: /, port: http}
+            periodSeconds: 5
+          resources: {{ toYaml .Values.resources.ui | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ui
+  namespace: open-swe-system
+spec:
+  selector: {app: open-swe-ui}
+  ports: [{name: http, port: 3000, targetPort: http}]

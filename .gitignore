@@ -53,6 +53,9 @@ credentials.json
 # LangGraph API
 .langgraph_api
 
+# Local k3d runtime state
+.open-swe/
+
 **/.claude/settings.local.json
 
 # Test traces

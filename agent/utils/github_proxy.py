@@ -9,11 +9,12 @@ before-model middleware re-configure the proxy before it goes stale.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from .github_app import (
     PermissionKey,
@@ -117,8 +118,9 @@ async def refresh_proxy_token(
     repositories: Sequence[str] | None = None,
     permissions: PermissionMap | None = None,
 ) -> bool:
-    """Re-configure a LangSmith sandbox proxy with a freshly minted token."""
-    if os.getenv("SANDBOX_TYPE", "langsmith") != "langsmith" or not thread_id:
+    """Re-configure a managed sandbox proxy with a freshly minted token."""
+    sandbox_type = os.getenv("SANDBOX_TYPE", "langsmith")
+    if sandbox_type not in {"langsmith", "k3"} or not thread_id:
         return False
 
     sandbox_backend = SANDBOX_BACKENDS.get(thread_id)
@@ -140,10 +142,14 @@ async def refresh_proxy_token(
         logger.warning("Proxy token refresh for thread %s failed: no installation token", thread_id)
         return False
 
-    from ..integrations.langsmith import _configure_github_proxy
-
     current_backend = unwrap_sandbox_backend(sandbox_backend)
-    await _configure_github_proxy(current_backend.id, token)
+    if sandbox_type == "langsmith":
+        from ..integrations.langsmith import _configure_github_proxy
+
+        await _configure_github_proxy(current_backend.id, token)
+    else:
+        configure_proxy = cast(Any, current_backend).configure_github_proxy
+        await asyncio.to_thread(configure_proxy, token, list(effective_repositories or ()))
     record_proxy_token_expiry(
         thread_id,
         expires_at,
@@ -157,8 +163,8 @@ async def refresh_proxy_token(
 async def maybe_refresh_proxy_token(thread_id: str | None, *, now: datetime | None = None) -> bool:
     """Re-configure the sandbox proxy with a fresh token when near expiry.
 
-    Returns True when a refresh was performed. Only applies to LangSmith
-    sandboxes; other providers don't use the proxy.
+    Returns True when a refresh was performed. Applies to managed providers
+    that keep GitHub credentials outside the sandbox.
     """
     if not thread_id or not proxy_token_needs_refresh(thread_id, now=now):
         return False

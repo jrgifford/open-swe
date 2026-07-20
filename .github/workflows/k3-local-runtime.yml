@@ -1,0 +1,59 @@
+name: K3 local runtime
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "agent/integrations/k3*.py"
+      - "deploy/k3/**"
+      - "scripts/k3_runtime.py"
+      - "tests/k3/**"
+      - "mise.toml"
+      - "mise.lock"
+      - "Makefile"
+      - ".github/workflows/k3-local-runtime.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  local-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      OPENAI_API_KEY: sk-ci-fixture
+      GITHUB_APP_CLIENT_ID: Iv1.cifixture
+      GITHUB_APP_CLIENT_SECRET: ci-fixture-secret-at-least-twenty
+      K3_FLAGS: --skip-credential-checks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          docker system prune --all --force
+      - name: Unit and chart checks
+        run: |
+          uv sync --extra dev --locked
+          uv run pytest -q tests/k3
+          helm lint deploy/k3/chart
+      - name: Fresh install and functional smoke
+        run: make start-k3
+      - name: Idempotent reconcile
+        run: make start-k3
+      - name: Stop and restart with state preserved
+        run: |
+          make stop-k3
+          make start-k3
+      - name: Status
+        if: always()
+        run: make status-k3 || true
+      - name: Diagnostics
+        if: failure()
+        run: make logs-k3 || true
+      - name: Destroy test cluster
+        if: always()
+        run: make destroy-k3 K3_DESTROY_FLAGS=--yes || true

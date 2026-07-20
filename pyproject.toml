@@ -10,6 +10,7 @@ dependencies = [
     "fastapi>=0.139.0",
     "uvicorn>=0.50.2",
     "httpx>=0.28.1",
+    "kubernetes>=32.0.1,<33",
     "PyJWT>=2.12.1",
     "cryptography>=49.0.0",
     "langgraph-sdk>=0.4.2",

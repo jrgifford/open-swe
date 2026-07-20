@@ -229,11 +229,17 @@ async def _start_langsmith_sandbox_if_needed(sandbox_backend: SandboxBackendProt
 
 async def _resolve_proxy_token(
     github_proxy_token: str | None,
+    repositories: Sequence[str] | None = None,
 ) -> tuple[str | None, str | None, None]:
-    """Resolve the proxy token and its expiry."""
+    """Resolve a proxy token with the narrowest available repository scope."""
     if github_proxy_token:
         return github_proxy_token, None, None
-    token, expires_at = await get_github_app_installation_token_with_expiry()
+    if repositories:
+        token, expires_at = await get_github_app_installation_token_with_expiry(
+            repositories=list(repositories)
+        )
+    else:
+        token, expires_at = await get_github_app_installation_token_with_expiry()
     return token, expires_at, None
 
 
@@ -264,20 +270,34 @@ async def _create_sandbox_with_proxy(
     sandbox_backend = await create_sandbox(snapshot_id=snapshot_id)
 
     sandbox_type = os.getenv("SANDBOX_TYPE", "langsmith")
-    if sandbox_type == "langsmith":
-        token, expires_at, permissions = await _resolve_proxy_token(github_proxy_token)
-        if not token:
-            msg = "Cannot configure proxy: GitHub App installation token is unavailable"
-            logger.error(msg)
-            raise ValueError(msg)
-        await _start_langsmith_sandbox_if_needed(sandbox_backend)
-        await _configure_github_proxy(sandbox_backend.id, token)
-        record_proxy_token_expiry(
-            thread_id,
-            expires_at,
-            repositories=github_proxy_repositories,
-            permissions=permissions,
-        )
+    try:
+        if sandbox_type in {"langsmith", "k3"}:
+            token, expires_at, permissions = await _resolve_proxy_token(
+                github_proxy_token, github_proxy_repositories
+            )
+            if not token:
+                msg = "Cannot configure proxy: GitHub App installation token is unavailable"
+                logger.error(msg)
+                raise ValueError(msg)
+            if sandbox_type == "langsmith":
+                await _start_langsmith_sandbox_if_needed(sandbox_backend)
+                await _configure_github_proxy(sandbox_backend.id, token)
+            else:
+                configure_proxy = cast(Any, sandbox_backend).configure_github_proxy
+                await asyncio.to_thread(
+                    configure_proxy, token, list(github_proxy_repositories or ())
+                )
+            record_proxy_token_expiry(
+                thread_id,
+                expires_at,
+                repositories=github_proxy_repositories,
+                permissions=permissions,
+            )
+    except Exception:
+        if sandbox_type == "k3":
+            discard = cast(Any, sandbox_backend).discard
+            await asyncio.to_thread(discard)
+        raise
 
     return sandbox_backend
 
@@ -289,11 +309,14 @@ async def _refresh_github_proxy(
     thread_id: str | None = None,
     github_proxy_repositories: Sequence[str] | None = None,
 ) -> None:
-    """Refresh GitHub proxy credentials for reused LangSmith sandboxes."""
-    if os.getenv("SANDBOX_TYPE", "langsmith") != "langsmith":
+    """Refresh GitHub proxy credentials for reused managed sandboxes."""
+    sandbox_type = os.getenv("SANDBOX_TYPE", "langsmith")
+    if sandbox_type not in {"langsmith", "k3"}:
         return
 
-    token, expires_at, permissions = await _resolve_proxy_token(github_proxy_token)
+    token, expires_at, permissions = await _resolve_proxy_token(
+        github_proxy_token, github_proxy_repositories
+    )
     if not token:
         logger.warning(
             "Skipping GitHub proxy refresh for sandbox %s: installation token unavailable",
@@ -302,8 +325,12 @@ async def _refresh_github_proxy(
         return
 
     current_backend = unwrap_sandbox_backend(sandbox_backend)
-    await _start_langsmith_sandbox_if_needed(current_backend)
-    await _configure_github_proxy(current_backend.id, token)
+    if sandbox_type == "langsmith":
+        await _start_langsmith_sandbox_if_needed(current_backend)
+        await _configure_github_proxy(current_backend.id, token)
+    else:
+        configure_proxy = cast(Any, current_backend).configure_github_proxy
+        await asyncio.to_thread(configure_proxy, token, list(github_proxy_repositories or ()))
     record_proxy_token_expiry(
         thread_id,
         expires_at,
@@ -328,6 +355,12 @@ async def _refresh_github_proxy_or_recreate(
             github_proxy_repositories=github_proxy_repositories,
         )
     except Exception:  # noqa: BLE001
+        if os.getenv("SANDBOX_TYPE", "langsmith") == "k3":
+            logger.exception(
+                "Failed to refresh GitHub proxy for K3 sandbox %s; preserving its workspace",
+                sandbox_backend.id,
+            )
+            raise
         logger.warning(
             "Failed to refresh GitHub proxy for sandbox %s on thread %s, recreating sandbox",
             sandbox_backend.id,
@@ -391,6 +424,9 @@ async def check_or_recreate_sandbox(
     try:
         await asyncio.to_thread(sandbox_backend.execute, "echo ok")
     except SandboxClientError:
+        if os.getenv("SANDBOX_TYPE", "langsmith") == "k3":
+            logger.info("Reattaching K3 sandbox %s for thread %s", sandbox_backend.id, thread_id)
+            return set_sandbox_backend(thread_id, await create_sandbox(sandbox_backend.id))
         logger.warning(
             "Cached sandbox is no longer reachable for thread %s, recreating",
             thread_id,
@@ -731,8 +767,19 @@ class PrepareAgentRunMiddleware(BasePrepareRunMiddleware):
                 resolve_triggering_user_identity, as_json_object(self._config), github_token
             )
         )
+        proxy_repositories = None
+        if (
+            prompt_default_repo
+            and prompt_default_repo.get("owner")
+            and prompt_default_repo.get("name")
+        ):
+            proxy_repositories = [f"{prompt_default_repo['owner']}/{prompt_default_repo['name']}"]
         sandbox_task = asyncio.create_task(
-            ensure_sandbox_for_thread(self._thread_id, repo=prompt_default_repo)
+            ensure_sandbox_for_thread(
+                self._thread_id,
+                repo=prompt_default_repo,
+                github_proxy_repositories=proxy_repositories,
+            )
         )
         triggering_user_identity, sandbox_backend = await asyncio.gather(
             triggering_user_identity_task,

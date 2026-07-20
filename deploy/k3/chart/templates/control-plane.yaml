@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+  namespace: open-swe-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: open-swe-control-plane}
+  template:
+    metadata:
+      labels: {app: open-swe-control-plane}
+    spec:
+      serviceAccountName: control-plane
+      containers:
+        - name: control-plane
+          image: {{ required "images.controlPlane is required" .Values.images.controlPlane | quote }}
+          imagePullPolicy: IfNotPresent
+          command: ["langgraph"]
+          args: ["dev", "--host", "0.0.0.0", "--port", "2024", "--no-browser", "--no-reload"]
+          ports: [{name: http, containerPort: 2024}]
+          envFrom:
+            - secretRef: {name: open-swe-env}
+          env:
+            - {name: SANDBOX_TYPE, value: k3}
+            - {name: K3_SANDBOX_NAMESPACE, value: open-swe-sandboxes}
+            - {name: K3_SANDBOX_IMAGE, value: {{ .Values.images.sandbox | quote }}}
+            - {name: K3_SANDBOX_CAPACITY, value: {{ .Values.config.sandboxCapacity | quote }}}
+            - {name: K3_SANDBOX_QUEUE_TIMEOUT_SECONDS, value: {{ .Values.config.sandboxQueueTimeoutSeconds | quote }}}
+            - {name: K3_GITHUB_PROXY_URL, value: "http://github-credential-proxy.open-swe-system.svc:8080"}
+            - {name: K3_GITHUB_PROXY_ADMIN_URL, value: "http://github-credential-proxy.open-swe-system.svc:8081"}
+            - {name: LANGSMITH_TRACING, value: "false"}
+            - {name: LANGGRAPH_CLI_NO_ANALYTICS, value: "1"}
+            - {name: DASHBOARD_ALLOWED_ORIGINS, value: {{ .Values.config.publicUrl | quote }}}
+          volumeMounts:
+            - {name: graph-state, mountPath: /app/.langgraph_api}
+          readinessProbe:
+            httpGet: {path: /ok, port: http}
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet: {path: /ok, port: http}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources: {{ toYaml .Values.resources.controlPlane | nindent 12 }}
+      volumes:
+        - name: graph-state
+          persistentVolumeClaim: {claimName: graph-state}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-plane
+  namespace: open-swe-system
+spec:
+  selector: {app: open-swe-control-plane}
+  ports: [{name: http, port: 2024, targetPort: http}]

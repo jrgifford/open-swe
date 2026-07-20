@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: open-swe
+  namespace: open-swe-system
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  rules:
+    - http:
+        paths:
+          {{- range list "/dashboard/api" "/webhooks" "/threads" "/runs" "/assistants" "/store" "/health" "/ok" "/info" "/docs" "/openapi.json" }}
+          - path: {{ . | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: control-plane
+                port: {number: 2024}
+          {{- end }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ui
+                port: {number: 3000}

@@ -1,0 +1,29 @@
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: open-swe
+servers: 1
+agents: 0
+image: rancher/k3s:v1.32.3-k3s1
+ports:
+  - port: "127.0.0.1:${K3_HOST_PORT}:80"
+    nodeFilters:
+      - loadbalancer
+options:
+  k3s:
+    extraArgs:
+      - arg: --kubelet-arg=eviction-hard=imagefs.available<2%,nodefs.available<2%
+        nodeFilters:
+          - server:0
+      - arg: --kubelet-arg=image-gc-high-threshold=99
+        nodeFilters:
+          - server:0
+      - arg: --kubelet-arg=image-gc-low-threshold=95
+        nodeFilters:
+          - server:0
+  k3d:
+    wait: true
+    timeout: 180s
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true

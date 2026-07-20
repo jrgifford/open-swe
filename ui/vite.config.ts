@@ -117,6 +117,14 @@ const SHIKI_LANGS = [
 ]
 
 const config = defineConfig({
+  // Prerendering the SPA shell boots `vite preview` and fetches its resolved
+  // URL. Nitro's preview defaults to binding IPv6 `[::1]`, but Node's fetch
+  // resolves `localhost` to IPv4 `127.0.0.1` first in slim container images
+  // (Docker build / CI), yielding ECONNREFUSED and an empty shell. Pin preview
+  // to IPv4 loopback so the resolved URL and the bound socket always agree.
+  preview: {
+    host: "127.0.0.1",
+  },
   optimizeDeps: {
     include: [
       "workbox-window",

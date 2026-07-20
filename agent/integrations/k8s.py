@@ -23,6 +23,11 @@ Configuration (all via environment variables):
     K8S_SANDBOX_STARTUP_TIMEOUT="180"       Seconds to wait for pod Ready.
     K8S_SANDBOX_DEFAULT_EXEC_TIMEOUT="300"  Default per-command timeout (s).
     K8S_SANDBOX_WORKDIR="/workspace"        Working directory inside the pod.
+    K8S_SANDBOX_ACTIVE_DEADLINE="3600"      Pod activeDeadlineSeconds — a hard
+                                            wall-clock cap after which Kubernetes
+                                            self-terminates the pod. Defence in
+                                            depth against orphaned sandboxes; set
+                                            to 0 to disable.
 
 Auth resolves in-cluster config first (when the agent server itself runs as a
 pod), then falls back to the local kubeconfig for development.
@@ -239,6 +244,11 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
         working_dir=workdir,
         resources=resources,
     )
+    # Hard wall-clock cap so a sandbox the server forgets to delete (e.g. the
+    # langgraph dev in-memory runtime never drives thread-end cleanup) can't
+    # linger forever holding CPU/memory. The out-of-band reaper CronJob is the
+    # primary GC; this is defence in depth. 0 disables it.
+    active_deadline = int(_env("K8S_SANDBOX_ACTIVE_DEADLINE", "3600"))
     spec = client.V1PodSpec(
         containers=[container],
         restart_policy="Never",
@@ -247,6 +257,7 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
         image_pull_secrets=[client.V1LocalObjectReference(name=pull_secret)] if pull_secret else None,
         # Sandboxes are ephemeral; don't let them linger draining on delete.
         termination_grace_period_seconds=5,
+        active_deadline_seconds=active_deadline if active_deadline > 0 else None,
     )
     return client.V1Pod(
         metadata=client.V1ObjectMeta(

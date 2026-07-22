@@ -286,14 +286,15 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
         # to contain it. Opt-in via K8S_SANDBOX_ENABLE_DIND.
         volumes.append(client.V1Volume(name="workspace", empty_dir=client.V1EmptyDirVolumeSource()))
         dind_disk = _env("K8S_SANDBOX_DIND_DISK", "20Gi")
-        volumes.append(
-            client.V1Volume(
-                name="dind-storage",
-                # Bound the layer store so a runaway build evicts THIS sandbox pod
-                # rather than filling node ephemeral storage (single node).
-                empty_dir=client.V1EmptyDirVolumeSource(size_limit=dind_disk),
-            )
-        )
+        # NOTE: /var/lib/docker is deliberately NOT a mounted volume. Under a
+        # microVM RuntimeClass (kata), an emptyDir is shared into the guest via
+        # virtio-fs, and overlayfs cannot be mounted on virtio-fs -> buildkit's
+        # overlay snapshotter dies ("mount overlay ... invalid argument") and
+        # `docker build` breaks. Leaving the layer store on the dind container's
+        # own rootfs keeps overlay working in the guest. The layer store is
+        # bounded by the dind container's ephemeral-storage limit below (a
+        # runaway build evicts THIS pod); under kata it fills the guest disk, not
+        # the node, so it can't impact other workloads either way.
         sandbox_mounts.append(client.V1VolumeMount(name="workspace", mount_path=workdir))
         sandbox_env.append(client.V1EnvVar(name="DOCKER_HOST", value="tcp://127.0.0.1:2375"))
         dind_image = _env(
@@ -333,11 +334,14 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
                     limits={
                         "cpu": _env("K8S_SANDBOX_DIND_CPU", "2"),
                         "memory": _env("K8S_SANDBOX_DIND_MEMORY", "4Gi"),
+                        # Bounds the docker layer store (now on the container
+                        # rootfs, see the note above) so a runaway build evicts
+                        # this sandbox pod instead of growing without limit.
+                        "ephemeral-storage": dind_disk,
                     },
                 ),
                 volume_mounts=[
                     client.V1VolumeMount(name="workspace", mount_path=workdir),
-                    client.V1VolumeMount(name="dind-storage", mount_path="/var/lib/docker"),
                 ],
             )
         )

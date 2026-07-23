@@ -286,15 +286,22 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
         # to contain it. Opt-in via K8S_SANDBOX_ENABLE_DIND.
         volumes.append(client.V1Volume(name="workspace", empty_dir=client.V1EmptyDirVolumeSource()))
         dind_disk = _env("K8S_SANDBOX_DIND_DISK", "20Gi")
-        # NOTE: /var/lib/docker is deliberately NOT a mounted volume. Under a
-        # microVM RuntimeClass (kata), an emptyDir is shared into the guest via
-        # virtio-fs, and overlayfs cannot be mounted on virtio-fs -> buildkit's
-        # overlay snapshotter dies ("mount overlay ... invalid argument") and
-        # `docker build` breaks. Leaving the layer store on the dind container's
-        # own rootfs keeps overlay working in the guest. The layer store is
-        # bounded by the dind container's ephemeral-storage limit below (a
-        # runaway build evicts THIS pod); under kata it fills the guest disk, not
-        # the node, so it can't impact other workloads either way.
+        # Backing store for the docker layer store. /var/lib/docker cannot be a
+        # plain emptyDir here: under a microVM RuntimeClass (kata) an emptyDir is
+        # shared into the guest via virtio-fs, and overlayfs cannot mount on
+        # virtio-fs -> buildkit's overlay snapshotter dies with
+        # "mount overlay ... invalid argument" and every `docker build` fails.
+        # Instead we mount this emptyDir at /dind-img; the dind entrypoint (below)
+        # puts a loop-backed ext4 on a file inside it and mounts THAT at
+        # /var/lib/docker, giving overlay a real block-backed filesystem in the
+        # guest (fast overlay2). The emptyDir sizeLimit bounds the backing file,
+        # so a runaway build evicts this pod instead of filling the node.
+        volumes.append(
+            client.V1Volume(
+                name="dind-img",
+                empty_dir=client.V1EmptyDirVolumeSource(size_limit=dind_disk),
+            )
+        )
         sandbox_mounts.append(client.V1VolumeMount(name="workspace", mount_path=workdir))
         sandbox_env.append(client.V1EnvVar(name="DOCKER_HOST", value="tcp://127.0.0.1:2375"))
         dind_image = _env(
@@ -307,16 +314,30 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
                 image=dind_image,
                 security_context=client.V1SecurityContext(privileged=True),
                 env=[client.V1EnvVar(name="DOCKER_TLS_CERTDIR", value="")],
-                # Bind ONLY to loopback (shared pod netns) so the unauthenticated,
-                # privileged docker API is not reachable from other pods on the
-                # cluster network. Leading `dockerd` stops the entrypoint from
-                # also injecting a 0.0.0.0 bind. --tls=false avoids the ~15s
-                # non-loopback-TLS-deprecation startup sleep.
+                command=["/bin/sh", "-c"],
                 args=[
-                    "dockerd",
-                    "--host=unix:///var/run/docker.sock",
-                    "--host=tcp://127.0.0.1:2375",
-                    "--tls=false",
+                    # Put a loop-backed ext4 on the /dind-img backing file and
+                    # mount it at /var/lib/docker BEFORE starting dockerd. The
+                    # kata guest kernel has the loop driver built in but no device
+                    # nodes (privileged_without_host_devices strips host /dev/* in
+                    # the microVM), so mknod them first. overlayfs can't mount on
+                    # the virtio-fs a plain emptyDir provides, but works fine on
+                    # this real block-backed ext4 -> fast overlay2 builds under
+                    # kata. Then hand off to the normal dind entrypoint. Loopback-
+                    # only binds keep the privileged docker API off the cluster
+                    # network; --tls=false skips the ~15s non-loopback-TLS sleep.
+                    "set -e; "
+                    "[ -e /dev/loop-control ] || mknod /dev/loop-control c 10 237; "
+                    "for i in $(seq 0 7); do [ -e /dev/loop$i ] || mknod /dev/loop$i b 7 $i; done; "
+                    "if ! grep -q ' /var/lib/docker ' /proc/mounts; then "
+                    f"truncate -s {dind_disk} /dind-img/docker.img; "
+                    "losetup /dev/loop0 /dind-img/docker.img; "
+                    "mkfs.ext4 -qF /dev/loop0; "
+                    "mkdir -p /var/lib/docker; mount /dev/loop0 /var/lib/docker; "
+                    "fi; "
+                    "exec dockerd-entrypoint.sh dockerd "
+                    "--host=unix:///var/run/docker.sock --host=tcp://127.0.0.1:2375 "
+                    "--tls=false --storage-driver=overlay2"
                 ],
                 # Gate pod-Ready on dockerd actually serving. Must be an EXEC
                 # probe (run inside the container): a TCP probe hits the pod IP,
@@ -334,14 +355,11 @@ def _build_pod_manifest(pod_name: str) -> client.V1Pod:
                     limits={
                         "cpu": _env("K8S_SANDBOX_DIND_CPU", "2"),
                         "memory": _env("K8S_SANDBOX_DIND_MEMORY", "4Gi"),
-                        # Bounds the docker layer store (now on the container
-                        # rootfs, see the note above) so a runaway build evicts
-                        # this sandbox pod instead of growing without limit.
-                        "ephemeral-storage": dind_disk,
                     },
                 ),
                 volume_mounts=[
                     client.V1VolumeMount(name="workspace", mount_path=workdir),
+                    client.V1VolumeMount(name="dind-img", mount_path="/dind-img"),
                 ],
             )
         )
